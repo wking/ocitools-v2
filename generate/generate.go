@@ -21,7 +21,8 @@ var (
 
 // Generator represents a generator for a container spec.
 type Generator struct {
-	spec *rspec.Spec
+	spec         *rspec.Spec
+	HostSpecific bool
 }
 
 // New creates a spec Generator with the default spec.
@@ -139,12 +140,16 @@ func New() Generator {
 			Devices: []rspec.Device{},
 		},
 	}
-	return Generator{&spec}
+	return Generator{
+		spec: &spec,
+	}
 }
 
 // NewFromSpec creates a spec Generator from a given spec.
 func NewFromSpec(spec *rspec.Spec) Generator {
-	return Generator{spec}
+	return Generator{
+		spec: spec,
+	}
 }
 
 // NewFromFile loads the template specifed in a file into a spec Generator.
@@ -166,7 +171,9 @@ func NewFromTemplate(r io.Reader) (Generator, error) {
 	if err := json.NewDecoder(r).Decode(&spec); err != nil {
 		return Generator{}, err
 	}
-	return Generator{&spec}, nil
+	return Generator{
+		spec: &spec,
+	}, nil
 }
 
 // SetSpec sets the spec in the Generator g.
@@ -174,8 +181,8 @@ func (g *Generator) SetSpec(spec *rspec.Spec) {
 	g.spec = spec
 }
 
-// GetSpec gets the spec in the Generator g.
-func (g *Generator) GetSpec() *rspec.Spec {
+// Spec gets the spec in the Generator g.
+func (g *Generator) Spec() *rspec.Spec {
 	return g.spec
 }
 
@@ -230,7 +237,9 @@ func (g *Generator) SetHostname(s string) {
 
 // ClearAnnotations clears g.spec.Annotations.
 func (g *Generator) ClearAnnotations() {
-	g.initSpec()
+	if g.spec == nil {
+		return
+	}
 	g.spec.Annotations = make(map[string]string)
 }
 
@@ -310,7 +319,9 @@ func (g *Generator) SetProcessArgs(args []string) {
 
 // ClearProcessEnv clears g.spec.Process.Env.
 func (g *Generator) ClearProcessEnv() {
-	g.initSpec()
+	if g.spec == nil {
+		return
+	}
 	g.spec.Process.Env = []string{}
 }
 
@@ -322,7 +333,9 @@ func (g *Generator) AddProcessEnv(env string) {
 
 // ClearProcessAdditionalGids clear g.spec.Process.AdditionalGids.
 func (g *Generator) ClearProcessAdditionalGids() {
-	g.initSpec()
+	if g.spec == nil {
+		return
+	}
 	g.spec.Process.User.AdditionalGids = []uint32{}
 }
 
@@ -886,11 +899,26 @@ func (g *Generator) AddPostStartHook(s string) error {
 
 // AddTmpfsMount adds a tmpfs mount into g.spec.Mounts.
 func (g *Generator) AddTmpfsMount(dest string) error {
-	mnt := rspec.Mount{
-		Destination: dest,
-		Type:        "tmpfs",
-		Source:      "tmpfs",
-		Options:     []string{"nosuid", "nodev", "mode=755"},
+	mnt := rspec.Mount{}
+
+	parts := strings.Split(dest, ":")
+	if len(parts) == 2 {
+		options := strings.Split(parts[1], ",")
+		mnt = rspec.Mount{
+			Destination: parts[0],
+			Type:        "tmpfs",
+			Source:      "tmpfs",
+			Options:     options,
+		}
+	} else if len(parts) == 1 {
+		mnt = rspec.Mount{
+			Destination: parts[0],
+			Type:        "tmpfs",
+			Source:      "tmpfs",
+			Options:     []string{"rw", "noexec", "nosuid", "nodev", "size=65536k"},
+		}
+	} else {
+		return fmt.Errorf("invalid value for --tmpfs")
 	}
 
 	g.initSpec()
@@ -953,6 +981,9 @@ func (g *Generator) SetupPrivileged(privileged bool) {
 		// Add all capabilities in privileged mode.
 		var finalCapList []string
 		for _, cap := range capability.List() {
+			if g.HostSpecific && cap > lastCap() {
+				continue
+			}
 			finalCapList = append(finalCapList, fmt.Sprintf("CAP_%s", strings.ToUpper(cap.String())))
 		}
 		g.initSpecLinux()
@@ -963,12 +994,25 @@ func (g *Generator) SetupPrivileged(privileged bool) {
 	}
 }
 
-func checkCap(c string) error {
+func lastCap() capability.Cap {
+	last := capability.CAP_LAST_CAP
+	// hack for RHEL6 which has no /proc/sys/kernel/cap_last_cap
+	if last == capability.Cap(63) {
+		last = capability.CAP_BLOCK_SUSPEND
+	}
+
+	return last
+}
+
+func checkCap(c string, hostSpecific bool) error {
 	isValid := false
 	cp := strings.ToUpper(c)
 
 	for _, cap := range capability.List() {
 		if cp == strings.ToUpper(cap.String()) {
+			if hostSpecific && cap > lastCap() {
+				return fmt.Errorf("CAP_%s is not supported on the current host", cp)
+			}
 			isValid = true
 			break
 		}
@@ -990,7 +1034,7 @@ func (g *Generator) ClearProcessCapabilities() {
 
 // AddProcessCapability adds a process capability into g.spec.Process.Capabilities.
 func (g *Generator) AddProcessCapability(c string) error {
-	if err := checkCap(c); err != nil {
+	if err := checkCap(c, g.HostSpecific); err != nil {
 		return err
 	}
 
@@ -1009,7 +1053,7 @@ func (g *Generator) AddProcessCapability(c string) error {
 
 // DropProcessCapability drops a process capability from g.spec.Process.Capabilities.
 func (g *Generator) DropProcessCapability(c string) error {
-	if err := checkCap(c); err != nil {
+	if err := checkCap(c, g.HostSpecific); err != nil {
 		return err
 	}
 
